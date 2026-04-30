@@ -10,12 +10,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let listener = TcpListener::bind(listen_addr).await?;
     println!();
-    println!("[*] TLS Handshake Harvester running on {}", listen_addr);
+    println!("TLS Handshake Harvester running on {}", listen_addr);
     if let Some(target) = &default_target {
-        println!("[*] Default target: {}", target);
+        println!("Default target: {}", target);
     }
-    println!("[*] Așteaptă TLS ClientHello-uri necriptate...\n");
-    println!("[*] Exemplu de utilizare: curl -x http://127.0.0.1:8080 https://www.google.com\n");
+    println!("Waiting for plaintext TLS ClientHello...\n");
+    println!("Usage: curl -x http://127.0.0.1:8080 https://www.google.com\n");
 
     loop {
         let (client, client_addr) = listener.accept().await?;
@@ -23,7 +23,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         tokio::spawn(async move {
             if let Err(err) = handle_connection(client, default_target, client_addr).await {
-                eprintln!("[!] Eroare la conexiune {}: {}", client_addr, err);
+                eprintln!("Connection error {}: {}", client_addr, err);
             }
         });
     }
@@ -37,6 +37,7 @@ async fn handle_connection(
     let mut read_buf = vec![0u8; 4096];
     let mut initial_data = Vec::new();
 
+    // Read until we have the full CONNECT request headers
     loop {
         let n = client.read(&mut read_buf).await?;
         if n == 0 {
@@ -58,7 +59,7 @@ async fn handle_connection(
     } else if let Some(target) = default_target {
         (target, false, Some(initial_data.clone()))
     } else {
-        return Err("No target host provided and no CONNECT request received".into());
+        return Err("No target host and no CONNECT request".into());
     };
 
     println!("[*] Client {} -> {}", client_addr, server_addr);
@@ -94,13 +95,14 @@ async fn intercept_and_forward(
         first_payload.extend_from_slice(&temp_buf[..n]);
     }
 
+    // Detect TLS ClientHello
     if first_payload.len() >= 6 && first_payload[0] == 0x16 && first_payload[5] == 0x01 {
-        println!("[!] INTERCEPTAT: TLS ClientHello necriptat de la {}", client_addr);
-        println!("[+] Se colectează date de handshake ({} bytes)", first_payload.len());
+        println!("INTERCEPTED: plaintext TLS ClientHello from {}", client_addr);
+        println!("Collecting handshake data ({} bytes)", first_payload.len());
 
         if let Some(client_hello) = parse_tls_client_hello(&first_payload) {
             if let Some(sni) = client_hello.sni {
-                println!("[+] SNI: {}", sni);
+                println!("SNI: {}", sni);
             }
 
             if !client_hello.supported_versions.is_empty() {
@@ -109,42 +111,43 @@ async fn intercept_and_forward(
                     .iter()
                     .map(|v| version_name(*v).to_string())
                     .collect();
-                println!("[+] Supported versions: {}", version_names.join(", "));
+                println!("Supported versions: {}", version_names.join(", "));
             }
 
             if client_hello.key_shares.is_empty() {
-                println!("[!] Nu s-a găsit extensia key_share în ClientHello.");
-                println!("    Acest client probabil nu folosește TLS 1.3 sau folosește o sesiune PSK fără key_share.");
-                println!("    Pentru un demo complet, folosește un client TLS 1.3 explicit, de exemplu:\n        curl --tlsv1.3 -x http://127.0.0.1:8080 https://www.google.com\n");
+                println!("No key_share extension found.");
+                println!("Client likely not using TLS 1.3 or uses PSK.");
+                println!("For full demo, force TLS 1.3: curl --tlsv1.3 -x http://127.0.0.1:8080 https://www.google.com\n");
             } else {
                 for entry in client_hello.key_shares.iter() {
                     println!(
-                        "[+] key_share group=0x{:04x} ({}) public_bytes={} bytes",
+                        "key_share group=0x{:04x} ({}) public_bytes={} bytes",
                         entry.group,
                         group_name(entry.group),
                         entry.payload.len()
                     );
-                    println!("    {}", hex::encode(&entry.payload));
+                    println!("{}", hex::encode(&entry.payload));
                 }
             }
             println!(
-                "[+] În practică, atacatorul stochează aceste puncte publice pentru decriptare ulterioară.\n"
+                "Attacker would store these public keys for later decryption.\n"
             );
         } else {
             let sample = &first_payload[..first_payload.len().min(64)];
             println!(
-                "[+] Exemplu de date salvate (primele {} bytes): {}",
+                "Raw data saved (first {} bytes): {}",
                 sample.len(),
                 hex::encode(sample)
             );
             println!(
-                "[+] Nu s-a putut parsa complet ClientHello; s-a salvat payload brut.\n"
+                "Failed to parse ClientHello completely; saved raw payload.\n"
             );
         }
     }
 
     server.write_all(&first_payload).await?;
 
+    // Forward data bidirectionally
     let (mut client_read, mut client_write) = client.split();
     let (mut server_read, mut server_write) = server.split();
 
